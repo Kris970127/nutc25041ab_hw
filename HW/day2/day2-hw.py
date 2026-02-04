@@ -12,7 +12,7 @@ llm = ChatOpenAI(
     api_key="token"
 )
 
-linkedin_prompt = ChatPromptTemplate.from_template("你是一位 LinkedIn 專家，請針對主題『{topic}』寫一段專業分析。生成30個字")
+linkedin_prompt = ChatPromptTemplate.from_template("你是一位 LinkedIn 專家，請針對主題『{topic}』寫一段專業分析。生成30個字vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv")
 ig_prompt = ChatPromptTemplate.from_template("你是一位 IG 網紅，請針對主題『{topic}』寫一段活潑短文。生成30個字")
 
 
@@ -33,7 +33,7 @@ map_chain = RunnableParallel(
 # 獲取使用者輸入
 user_topic = input("輸入主題：")
 
-# --- 任務一：串流模式 (Streaming) ---
+# --- 任務一：串流模式 (Streaming) 
 # 此階段會交錯輸出字典片段
 print("\n--- 開始生成摘要 (串流模式) ---")
 for chunk in map_chain.stream({"topic": user_topic}):
