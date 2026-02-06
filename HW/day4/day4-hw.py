@@ -3,22 +3,24 @@ import base64
 import operator
 import requests
 import json
+from datetime import datetime
 from typing import Annotated, List, TypedDict, Literal
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from playwright.sync_api import sync_playwright
 
 # --- 1. 核心模型初始化 ---
+# 請確保 base_url 與 api_key 正確無誤
 llm = ChatOpenAI(
-    base_url="https://ws-02.wade0426.me/v1",
-    api_key="YOUR_API_KEY", # 請更換為您的金鑰
+    base_url="https://ws-05.huannago.com/v1", 
+    api_key="YOUR_API_KEY", 
     model="google/gemma-3-27b-it",
     temperature=0
 )
 
-# --- 2. 定義狀態 (State) ---
+# --- 2. 定義狀態 ---
 class AgentState(TypedDict):
     input: str
     queries: List[str]
@@ -26,132 +28,161 @@ class AgentState(TypedDict):
     search_results: List[dict]
     is_sufficient: bool
     round: int
+    missing_info: str
     final_answer: str
 
 # --- 3. 核心工具函數 ---
 
 def search_searxng(query: str):
-    """執行搜尋引擎檢索"""
+    """執行搜尋引擎檢索，並預先清理關鍵字"""
     url = "https://puli-8080.huannago.com/search"
-    params = {"q": query, "format": "json", "language": "zh-TW"}
+    clean_query = query.strip().split('\n')[0].replace('*', '').replace('"', '')
+    params = {"q": clean_query, "format": "json", "language": "zh-TW"}
     try:
-        response = requests.get(url, params=params, timeout=10)
-        return response.json().get('results', [])[:5] # 多取幾筆供篩選
-    except:
+        response = requests.get(url, params=params, timeout=15)
+        return response.json().get('results', [])[:5]
+    except Exception as e:
+        print(f"🌐 搜尋引擎連接失敗: {e}")
         return []
 
-def vlm_read_website(url: str, title: str):
-    """使用 Playwright 進行視覺化閱讀"""
+def vlm_read_website(url: str, title: str, original_q: str):
+    """強化版視覺網頁讀取：模擬真實瀏覽器行為，解決截圖空白問題"""
     try:
         with sync_playwright() as p:
+            # 模擬真實瀏覽器環境，避開部分防爬蟲機制
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            # 增加等待時間確保內容加載
-            page.goto(url, wait_until="networkidle", timeout=45000)
-            page.wait_for_timeout(3000) 
-            screenshot_b64 = base64.b64encode(page.screenshot()).decode('utf-8')
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                viewport={'width': 1280, 'height': 800}
+            )
+            page = context.new_page()
+            
+            # 延長超時時間並等待 DOM 加載
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3000) # 給予額外渲染時間
+            
+            # 自動向下滾動觸發懶加載 (Lazy Loading)
+            page.mouse.wheel(0, 800)
+            page.wait_for_timeout(1000)
+
+            screenshot_b64 = base64.b64encode(page.screenshot(full_page=False)).decode('utf-8')
             browser.close()
 
+            # 指引 VLM 進行嚴謹的事實提取
             msg = [
-                {"type": "text", "text": f"網頁標題：{title}。請摘要這篇報導中關於「發售日期、延期紀錄、官方公告時間」的具體事實。"},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}}
+                {"role": "user", "content": [
+                    {"type": "text", "text": f"網頁標題：{title}\n用戶問題：{original_q}\n請依據『調查員原則』提取證據：\n1. 找出所有具體日期與版本數據。\n2. 識別官方公告與傳聞的區別。\n3. 若提到『延期』，請找原始日期與新日期。"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}}
+                ]}
             ]
-            return llm.invoke([HumanMessage(content=msg)]).content
+            return llm.invoke(msg).content
     except Exception as e:
-        return f"視覺讀取失敗: {str(e)}"
+        return f"視覺讀取失敗 (來源: {url}): {str(e)}"
 
-# --- 4. LangGraph 節點實作 ---
-
-def check_cache_node(state: AgentState):
-    print(f"🔍 [Cache] 檢查快取：{state['input']}")
-    return {"round": 0, "knowledge_base": []}
+# --- 4. 嚴謹節點實作 ---
 
 def planner_node(state: AgentState):
+    """決策節點：判斷資訊是否構成完整的證據鏈"""
     current_round = state.get("round", 0)
-    MAX_ROUNDS = 3 
+    MAX_ROUNDS = 3
+    print(f"\n🧠 [思考] 第 {current_round} 輪調查")
     
-    print(f"\n🧠 [Think] Round {current_round}")
-    
-    if current_round >= MAX_ROUNDS:
-        return {"is_sufficient": True}
-
-    if not state.get("knowledge_base"):
-        return {"is_sufficient": False, "round": current_round + 1}
+    if current_round >= MAX_ROUNDS: return {"is_sufficient": True}
+    if not state.get("knowledge_base"): return {"is_sufficient": False, "round": current_round + 1}
     
     context = "\n".join(state["knowledge_base"])
-    # 強化判斷邏輯，要求檢查是否有矛盾或不完整
-    prompt = f"問題：{state['input']}\n目前查到的資訊：{context}\n這些資訊是否涵蓋了該問題的所有歷史變動或次數？請回答 Y 或 N。"
-    res = llm.invoke(prompt)
+    prompt = f"""使用者問題：{state['input']}
+    現有資料內容：{context}
     
-    is_ok = "Y" in res.content.upper()
-    print(f"{'✅ 資訊已足夠' if is_ok else '❌ 資訊仍不足，繼續追蹤'}")
-    return {"is_sufficient": is_ok, "round": current_round + 1}
+    請以『懷疑論』立場評估：
+    1. 是否已有明確的官方數據或日期？
+    2. 是否能排除媒體猜測並形成完整時間軸？
+    如果已足以結案，請回覆 'DONE'。
+    否則，請簡短描述『還缺少的特定拼圖』。"""
+    
+    res = llm.invoke(prompt).content
+    if "DONE" in res.upper():
+        return {"is_sufficient": True}
+    else:
+        print(f"❌ 證據鏈不足：{res[:60]}...")
+        return {"is_sufficient": False, "round": current_round + 1, "missing_info": res}
 
 def query_gen_node(state: AgentState):
-    # 針對延期問題，生成更具追溯性的關鍵字
-    prompt = f"針對問題 '{state['input']}'，請生成一個能搜到『歷史變動』或『多次紀錄』的繁體中文搜尋關鍵字（例如：GTA 6 歷次延期 整理）。"
-    res = llm.invoke(prompt)
-    query = res.content.strip().replace('"', '')
-    print(f"🔑 生成關鍵字：{query}")
+    """
+    究極嚴謹版關鍵字生成
+    導入：多方求證、結構化思考、懷疑論、時效性
+    """
+    history = ", ".join(state.get("queries", []))
+    missing = state.get("missing_info", "基礎背景事實")
+    
+    # 強化的系統提示詞，模仿截圖中的偵探人格
+    system_prompt = f"""你是一名頂尖的資深調查員，當前日期是 {datetime.now().strftime('%Y-%m-%d')}。
+    你必須遵循以下核心準則來生成搜尋詞：
+    - **多方求證**：針對現有說法尋找反向證據或官方來源。
+    - **結構化思考**：從歷史變動、財報數據、官方社群等多維度切入。
+    - **時效性**：確保搜尋詞能涵蓋最新的動態與歷史的節點。
+    
+    任務：針對問題『{state['input']}』，補足缺失資訊：『{missing}』。
+    要求：僅輸出一個精確的搜尋關鍵字，禁止 Markdown、引號或任何解釋。"""
+
+    res = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"已嘗試過的關鍵字：[{history}]。請給出下一個搜尋方向。")
+    ]).content
+
+    query = res.strip().split('\n')[0].replace('*', '').replace('"', '').replace('搜尋關鍵字：', '')
+    print(f"🔑 [調查級搜尋]：{query}")
     return {"queries": [query]}
 
 def search_tool_node(state: AgentState):
-    query = state["queries"][-1]
-    print(f"🌐 訪問：執行 SearXNG 網路搜尋...")
-    return {"search_results": search_searxng(query)}
+    return {"search_results": search_searxng(state["queries"][-1])}
 
 def vlm_processing_node(state: AgentState):
-    """優化：一次讀取前 2 筆結果，確保不漏掉舊資訊"""
     new_info = []
     results = state.get("search_results", [])
-    
-    # 讀取前 2 筆不同的來源
+    if not results:
+        return {"knowledge_base": ["(此輪搜尋未獲取有效網頁)"]}
+
     for i in range(min(2, len(results))):
         target = results[i]
-        print(f"📸 [VLM] 啟動視覺閱讀 ({i+1}/2)：{target.get('title')[:20]}...")
-        summary = vlm_read_website(target['url'], target.get('title', '無標題'))
-        new_info.append(f"【來源 {i+1}】: {target['url']}\n【摘要】: {summary}\n")
-    
-    print(f"📝 內容已成功存入知識庫")
+        print(f"📸 [視覺查證] 正在讀取：{target.get('title')[:20]}...")
+        summary = vlm_read_website(target['url'], target.get('title', '無標題'), state['input'])
+        new_info.append(f"【來源】: {target['url']}\n【事實摘要】: {summary}\n")
     return {"knowledge_base": new_info}
 
 def final_answer_node(state: AgentState):
-    print(f"\n🏁 [Output] 正在生成最終查證回答...")
+    """最終彙整：執行邏輯推理與時間軸排序"""
+    print(f"\n🏁 [Final Report] 正在產出嚴謹報告...")
     context = "\n".join(state.get("knowledge_base", []))
     
     prompt = f"""
-    請根據以下多個來源的資訊，嚴謹地回答問題：{state['input']}
+    你是專業調查分析師。請根據以下蒐集到的零散資訊，為用戶問題『{state['input']}』產出報告。
     
-    要求：
-    1. 若不同來源提到的次數或日期不同，請完整列出變動歷程。
-    2. 使用繁體中文，保留專有名詞。
-    3. 採用「條列式」說明各階段的日期。
-    4. 若有明確的延期次數，請直接指出。
+    【推論要求】
+    1. 務必建立事件的時間軸 (Timeline)。
+    2. 計算發生的次數，並指出每次變動的『前、後』狀態。
+    3. 區分官方正式公告 (Official) 與媒體傳聞 (Rumor)。
     
-    參考資訊：
+    查證資料內容：
     {context}
     """
-    res = llm.invoke(prompt)
-    return {"final_answer": res.content}
+    res = llm.invoke(prompt).content
+    return {"final_answer": res}
 
 # --- 5. 構建圖表 ---
 workflow = StateGraph(AgentState)
-workflow.add_node("check_cache", check_cache_node)
 workflow.add_node("planner", planner_node)
 workflow.add_node("query_gen", query_gen_node)
 workflow.add_node("search_tool", search_tool_node)
 workflow.add_node("vlm_processing", vlm_processing_node)
 workflow.add_node("final_answer", final_answer_node)
 
-workflow.set_entry_point("check_cache")
-workflow.add_edge("check_cache", "planner")
-
+workflow.set_entry_point("planner")
 workflow.add_conditional_edges(
-    "planner",
-    lambda x: "end" if x["is_sufficient"] else "search",
+    "planner", 
+    lambda x: "end" if x["is_sufficient"] else "search", 
     {"end": "final_answer", "search": "query_gen"}
 )
-
 workflow.add_edge("query_gen", "search_tool")
 workflow.add_edge("search_tool", "vlm_processing")
 workflow.add_edge("vlm_processing", "planner")
@@ -160,16 +191,24 @@ workflow.add_edge("final_answer", END)
 app = workflow.compile()
 
 # --- 6. 互動執行 ---
-print(app.get_graph().draw_ascii())
 if __name__ == "__main__":
-    user_q = input("🔍 請輸入您想查證的問題: ")
-    if user_q.strip():
-        final_state = app.invoke({
-            "input": user_q, 
-            "knowledge_base": [], 
-            "queries": [], 
-            "search_results": [],
-            "round": 0
-        })
-        print("\n🎯 【最終查證結果】")
-        print(final_state.get("final_answer", "未能生成答案"))
+    print("🕵️ 調查級 Agent 已準備就緒。輸入 'q' 結束對話。")
+    while True:
+        user_q = input("\n🔍 請輸入您的問題: ")
+        if user_q.lower() == 'q': break
+        
+        try:
+            final_state = app.invoke({
+                "input": user_q, 
+                "knowledge_base": [], 
+                "queries": [], 
+                "round": 0,
+                "missing_info": "",
+                "final_answer": ""
+            })
+            
+            print("\n" + "—"*50)
+            print(f"🎯 【最終調查報告】\n\n{final_state.get('final_answer')}")
+            print("—"*50)
+        except Exception as e:
+            print(f"🔥 系統執行中斷: {e}")
