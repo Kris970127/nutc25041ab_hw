@@ -191,6 +191,7 @@ workflow.add_edge("final_answer", END)
 app = workflow.compile()
 
 # --- 6. 互動執行 ---
+print(app.get_graph().draw_ascii())
 if __name__ == "__main__":
     print("🕵️ 調查級 Agent 已準備就緒。輸入 'q' 結束對話。")
     while True:
